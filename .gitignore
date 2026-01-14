@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test outputs
+test_output_*/
+conversion_reports/
+*.log
+
+# Converted files (if testing locally)
+# Uncomment to ignore all markdown outputs during dev:
+# *.md
+# !README.md
+
+# Temporary files
+*.tmp
+*.bak
+*copy.py
+document_converter*.py
+batch_converter.py
+run_*.py
+test_converter.py
