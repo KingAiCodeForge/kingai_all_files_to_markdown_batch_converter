@@ -1,5 +1,5 @@
 # KingAI Markdown Converter
-
+perfect for converting the PDFs for the Epstein files to interacted formats
 High-performance batch document-to-Markdown converter powered by Microsoft's MarkItDown with quality-scored multi-library fallbacks. Designed for creating LLM-friendly Markdown from large document collections.
 
 **Optimized for i9-9900K (8 cores / 16 threads)**
