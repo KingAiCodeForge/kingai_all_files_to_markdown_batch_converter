@@ -41,6 +41,8 @@ desktop.ini
 
 # Test outputs
 test_output_*/
+test_*.py
+tests/
 conversion_reports/
 *.log
 
@@ -48,6 +50,10 @@ conversion_reports/
 # Uncomment to ignore all markdown outputs during dev:
 # *.md
 # !README.md
+
+# Design docs (internal working notes, not shipped)
+GRACEFUL_DEGRADATION_DESIGN.md
+*_DESIGN.md
 
 # Temporary files
 *.tmp

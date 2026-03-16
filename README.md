@@ -1,20 +1,28 @@
 # KingAI Markdown Converter
-perfect for converting the PDFs for the Epstein files to interacted formats
-High-performance batch document-to-Markdown converter powered by Microsoft's MarkItDown with quality-scored multi-library fallbacks. Designed for creating LLM-friendly Markdown from large document collections.
 
-**Optimized for i9-9900K (8 cores / 16 threads)**
-please change the workers to your cpu cores / threads if not using i9-9900k. use speccy or hwinfo to find this or info scripts in terminal or powershell.
+Batch document-to-Markdown converter using Microsoft's MarkItDown with multi-library fallbacks.
+Designed for converting large document collections into text that's searchable and usable with LLMs.
+
+Uses multiprocessing — set `--workers` to match your CPU thread count.
+
 ## Features
 
-- ✅ **Multiprocessing** - Uses all CPU cores for parallel conversion
-- ✅ **Multiple formats** - PDF, DOCX, XLSX, PPTX, HTML, CSV, JSON, and more
-- ✅ **Smart fallbacks** - Multiple extraction methods per format
-- ✅ **Recursive scanning** - Process entire folder trees
-- ✅ **Structure preservation** - Maintains folder hierarchy in output
-- ✅ **Dry run mode** - Preview what will be converted
-- ✅ **JSON reports** - Detailed conversion statistics
+- **Multiprocessing** — parallel conversion across CPU cores
+- **Multiple formats** — PDF, DOCX, XLSX, PPTX, HTML, CSV, JSON, and more
+- **Multi-library fallback** — 4 PDF extraction backends, picks the best result by word count
+- **Pre-flight validation** — checks file headers (magic bytes) and minimum sizes before wasting time on corrupt files
+- **Exponential backoff** — jittered delays between extractor failures to reduce thrashing
+- **Batch chunking** — processes files in batches of 200 with checkpoints between them
+- **Crash recovery** — `--resume` flag to continue from where the last run stopped
+- **Adaptive workers** — automatically reduces worker count when failure rate is high or memory is low
+- **File logging** — progress log written to disk, survives terminal crashes
+- **Error classification** — failures categorized as invalid_file, corrupt, timeout, etc. for actionable reports
+- **Recursive scanning** — process entire folder trees
+- **Structure preservation** — maintains folder hierarchy in output
+- **Dry run mode** — preview what will be converted
+- **JSON reports** — detailed conversion statistics
 
-> For diagrams and complex images, review output and extract manually if needed.
+> Complex images, diagrams, and heavily-formatted tables may not convert perfectly. Review output for these.
 
 ## Searchability & Context
 
@@ -23,7 +31,7 @@ Converted Markdown is designed for easy string search with technical context:
 - Protocol keywords like `ALDL`, `OBD-II`, `VPW`, `KWP2000`
 - ECU terms like `XDF`, `ADX`, `BIN`, `CAL`, `HC11`
 - Headings, tables, and lists preserved for contextual matching
-## Supported Formats right now. will expand and add spreadsheets later. image to text next.
+## Supported Formats
 
 | Extension | Type |
 |-----------|------|
@@ -56,62 +64,74 @@ pip install markitdown[all]
 
 ```powershell
 # Convert all PDFs in a folder
-python convert.py "E:\Downloads" --extensions pdf
+python convert.py "./documents" --extensions pdf
 
 # Convert PDFs and Word docs
-python convert.py "A:\repos" --extensions pdf docx
+python convert.py "./source" --extensions pdf docx
 
 # Convert to a specific output folder
-python convert.py "E:\Downloads" -o "A:\repos\converted_docs"
+python convert.py "./documents" -o "./converted_docs"
 ```
 
 ### Advanced Usage
 
 ```powershell
-# Use maximum workers (16 for i9-9900K)
-python convert.py "E:\Downloads" --workers 16 --extensions pdf docx xlsx
+# Use maximum workers (adjust for your CPU)
+python convert.py "./documents" --workers 16 --extensions pdf docx xlsx
 
 # Dry run to preview
-python convert.py "A:\repos" --dry-run
+python convert.py "./source" --dry-run
 
 # Overwrite existing conversions
-python convert.py "E:\Downloads" --overwrite
+python convert.py "./documents" --overwrite
 
 # Non-recursive (current folder only)
-python convert.py "E:\Downloads" --no-recursive
+python convert.py "./documents" --no-recursive
 
 # Exclude certain patterns
-python convert.py "A:\repos" --exclude __pycache__ .git node_modules
+python convert.py "./source" --exclude __pycache__ .git node_modules
 
 # Flat output (no subdirectories)
-python convert.py "E:\Downloads" -o "C:\converted" --flat
+python convert.py "./documents" -o "./converted" --flat
 
 # Save conversion report
-python convert.py "E:\Downloads" --report conversion_report.json -v
+python convert.py "./documents" --report conversion_report.json -v
+
+# Resume after crash or interruption (v1.1)
+python convert.py "./documents" -o "./output" --resume
+
+# Safe mode: 2 workers, maximum caution (v1.1)
+python convert.py "./documents" --safe-mode -e pdf
+
+# Custom batch size for very large runs (v1.1)
+python convert.py "./documents" --batch-size 100 -e pdf
+
+# Log to file so progress survives terminal crash (v1.1)
+python convert.py "./documents" --log-file conversion.log -e pdf
 ```
 
 ### Using the Batch File
 
 ```powershell
 # Windows - just double-click or run:
-convert.bat "E:\Downloads" -o "A:\repos\markdown_exports"
+convert.bat "./documents" -o "./markdown_exports"
 ```
 
-## Examples for KingAI Projects
+## Usage Examples
 
-### Convert E:\Downloads PDFs to Markdown
+### Convert PDFs to Markdown
 ```powershell
-python convert.py "E:\Downloads" -o "A:\repos\kingai_markdown_exports" --extensions pdf docx -v
+python convert.py "./documents" -o "./markdown_exports" --extensions pdf docx -v
 ```
 
-### Convert A:\repos documents
+### Convert source documents
 ```powershell
-python convert.py "A:\repos" -o "A:\repos\kingai_markdown_exports" --extensions pdf docx xlsx pptx -v --exclude __pycache__ .git
+python convert.py "./source" -o "./markdown_exports" --extensions pdf docx xlsx pptx -v --exclude __pycache__ .git
 ```
 
-### Full KingAI document export (both drives)
+### Full document export (multiple source dirs)
 ```powershell
-python convert.py "E:\Downloads" "A:\repos" -o "A:\repos\kingai_markdown_exports" --workers 12 --extensions pdf docx --report export_report.json -v
+python convert.py "./documents" "./source" -o "./markdown_exports" --workers 12 --extensions pdf docx --report export_report.json -v
 ```
 
 ## Performance
@@ -128,13 +148,22 @@ Times vary based on PDF complexity, page count, and whether they contain tables/
 
 ## Error Handling
 
-The converter uses multiple fallback methods:
+The converter uses multiple layers of error handling (v1.1):
 
-1. **PDF**: pdfplumber → pdfminer → basic text extraction
+**Pre-flight validation:**
+- Files checked for minimum size and correct magic bytes (file header) before any extraction attempt
+- Catches corrupt downloads, zero-byte files, and renamed files immediately
+
+**Extractor fallback with backoff:**
+1. **PDF**: markitdown → pymupdf4llm → pymupdf → pdfplumber (with jittered exponential backoff between failures)
 2. **DOCX**: mammoth (HTML) → python-docx → basic extraction
 3. **XLSX**: openpyxl + pandas → xlrd fallback
 
-If a file fails, it's logged and the converter continues with the next file.
+**Error classification:**
+Each failure is categorized (invalid_file, corrupt_file, extractor_crash, timeout, memory_error, dependency_missing, permission_error) so the JSON report tells you what to fix.
+
+**Crash recovery:**
+If the process is interrupted (Ctrl+C, terminal crash, OOM), use `--resume` to continue from the last checkpoint. Progress is saved after each batch.
 
 ## Output Format
 
@@ -148,12 +177,7 @@ Example output:
 <!-- Converted from: Service Report.pdf -->
 <!-- Converted at: 2026-01-12T15:30:00 -->
 
-# Service Report
 
-**Client Code**: IGPAS004732
-**Date**: 27 June 2025
-...
-```
 
 ## License
 
@@ -167,7 +191,25 @@ Jason King
 
 ---
 
-## v2.0 Features (January 2026)
+## v1.1 Changes (February 2026)
+
+### Graceful Degradation for Large Runs
+
+When processing thousands of files, v1.0 could crash on corrupt files, run out of memory with too many workers, and lose all progress if the terminal died. v1.1 fixes these specific problems:
+
+**Pre-flight validation:** Checks magic bytes and minimum file sizes before passing files to extractors. A 4-byte "PDF" is caught immediately instead of crashing all 4 extraction backends.
+
+**Exponential backoff with Full Jitter:** When an extractor fails, waits a randomized delay before trying the next one. Based on the AWS architecture pattern (`sleep = random(0, min(cap, base * 2^attempt))`). Prevents correlated resource spikes when multiple workers hit bad files simultaneously.
+
+**Batch chunking:** Files are processed in batches of 200 (configurable with `--batch-size`). Between batches: checkpoint is saved, garbage collection runs, and memory is checked. This prevents submitting 11,000 futures at once.
+
+**Crash recovery:** A `.convert_checkpoint.json` file is saved after each batch. Use `--resume` to skip already-completed files after a crash or interruption.
+
+**Adaptive worker scaling:** Monitors failure rate over a sliding window. If >15% of recent files fail, workers are automatically reduced. If `psutil` is installed, also checks memory pressure and forces safe mode above 90% usage.
+
+**Error classification:** Failures are categorized (invalid_file, corrupt_file, timeout, memory_error, etc.) so the JSON report shows what actually went wrong, not just a wall of tracebacks.
+
+**File logging:** Progress is written to `conversion_progress.log` in the output directory. Survives terminal crashes.
 
 ### Multi-Library PDF Extraction with Quality Scoring
 
@@ -214,7 +256,7 @@ Each conversion now tracks:
 ### JSON Report with Full Statistics
 
 ```powershell
-python convert.py "E:\Downloads" --report conversion_report.json
+python convert.py "./documents" --report conversion_report.json
 ```
 
 Generates detailed JSON report:
@@ -264,42 +306,13 @@ If `tqdm` is not installed, falls back to simple percentage display:
 
 ---
 
-## 🚀 Future Roadmap
+## Possible Future Work
 
-### Advanced OCR & Image Processing
-- **Diagram extraction**: Parse EEPROM pinout diagrams, PCB schematics, wiring diagrams
-- **Technical drawing analysis**: Extract table data from scanned datasheets and service manuals
-- **Handwritten notes**: OCR support for handwritten annotations on documents
-- **Image-to-Markdown tables**: Convert complex tables in images to clean Markdown format
-
-### Domain-Specific Extraction
-- **Automotive ECU data**: Enhanced parsing for calibration tables, memory maps, addressing schemes (0x0000, $181E1)
-- **Electronics datasheets**: Structured extraction of pinouts, timing diagrams, register maps
-- **Scientific papers**: Better equation extraction (LaTeX/MathML), figure captions, references
-- **Legal documents**: Clause numbering, citations, structured sections
-
-### Semantic Enhancement
-- **Keyword tagging**: Auto-tag content with domain terms (ALDL, OBD-II, KWP2000, HC11, XDF)
-- **Cross-referencing**: Link hex addresses to definitions across multiple documents
-- **Glossary generation**: Build terminology indexes for technical document collections
-- **Context preservation**: Maintain relationships between figures, tables, and references
-
-### Output Formats & Integrations
-- **Vector database export**: Direct export to Pinecone, Weaviate, ChromaDB for RAG/LLM
-- **Structured JSON**: JSON-LD with embedded metadata for knowledge graphs
-- **LaTeX output**: Convert back to LaTeX for academic publishing
-- **HTML with anchors**: Navigable HTML with table of contents and deep linking
-
-### Performance & Scale
-- **GPU acceleration**: Use CUDA for OCR and image processing on large batches
-- **Cloud deployment**: Docker containers with API endpoints (REST/GraphQL)
-- **Streaming processing**: Handle multi-GB PDFs without loading entire file into memory
-- **Incremental updates**: Only re-process changed sections of documents
-
-### Plugin Architecture
-- **Custom extractors**: Python plugin system for domain-specific parsers
-- **Template library**: Pre-built extraction templates for common document types
-- **Post-processing hooks**: Custom filters for cleaning/enhancing extracted text
+- **OCR for scanned PDFs** — Tesseract/Pillow integration for image-based text extraction
+- **Image-to-text** — Extract text from diagrams, datasheets, and schematics
+- **Spreadsheet improvements** — Better table formatting for complex Excel files
+- **Vector DB export** — Direct output to Pinecone/ChromaDB for RAG pipelines
+- **Keyword tagging** — Auto-tag with domain terms (for automotive: ALDL, OBD-II, KWP2000, etc.)
 
 ---
 

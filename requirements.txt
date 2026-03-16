@@ -1,4 +1,4 @@
-# KingAI Markdown Converter v2.0 Requirements
+# KingAI Markdown Converter v1.1 Requirements
 # Install: pip install -r requirements.txt
 
 # Core conversion library (Microsoft)
@@ -30,6 +30,12 @@ pandas>=2.0.0
 # Encoding detection
 charset-normalizer>=3.0.0
 magika>=0.5.0
+
+# v1.1: Memory monitoring for adaptive worker scaling (optional)
+psutil>=5.9.0
+
+# v1.1: Rich terminal output (optional, falls back to tqdm/print)
+rich>=13.0.0
 
 # Optional: Image OCR support (uncomment if needed)
 # Pillow>=10.0.0
