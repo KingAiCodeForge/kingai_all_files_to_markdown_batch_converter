@@ -54,6 +54,10 @@ conversion_reports/
 # Design docs (internal working notes, not shipped)
 GRACEFUL_DEGRADATION_DESIGN.md
 *_DESIGN.md
+KingAi_TODO_README.md
+**/KingAi_TODO_README.md
+**/ignore/**
+!**/ignore/.gitkeep
 
 # Temporary files
 *.tmp

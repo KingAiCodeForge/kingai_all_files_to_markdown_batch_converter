@@ -106,6 +106,9 @@ python convert.py "./documents" --safe-mode -e pdf
 # Custom batch size for very large runs (v1.1)
 python convert.py "./documents" --batch-size 100 -e pdf
 
+# Bound stuck third-party parsers to 90 seconds per file (v1.1)
+python convert.py "./documents" --file-timeout 90 --batch-size 1 --workers 1
+
 # Log to file so progress survives terminal crash (v1.1)
 python convert.py "./documents" --log-file conversion.log -e pdf
 ```

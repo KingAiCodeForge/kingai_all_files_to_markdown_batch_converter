@@ -38,7 +38,7 @@ import sys
 import time
 import hashlib
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import ceil
@@ -143,6 +143,7 @@ FILE_SIGNATURES = {
 
 # Batch processing defaults
 DEFAULT_BATCH_SIZE = 200
+DEFAULT_FILE_TIMEOUT_SECONDS = 300
 
 
 class ErrorClass:
@@ -752,6 +753,26 @@ def get_output_path(
     return output_path
 
 
+def terminate_executor_workers(executor: ProcessPoolExecutor) -> None:
+    """Best-effort hard stop for workers stuck inside third-party parsers."""
+    terminate_workers = getattr(executor, "terminate_workers", None)
+    if callable(terminate_workers):
+        terminate_workers()
+        return
+
+    processes = getattr(executor, "_processes", None)
+    if not processes:
+        executor.shutdown(wait=False, cancel_futures=True)
+        return
+
+    for process in list(processes.values()):
+        if process.is_alive():
+            process.terminate()
+
+    for process in list(processes.values()):
+        process.join(timeout=2)
+
+
 def batch_convert(
     input_dirs: List[str],
     output_dir: Optional[str] = None,
@@ -766,6 +787,7 @@ def batch_convert(
     batch_size: int = DEFAULT_BATCH_SIZE,
     resume: bool = False,
     log_file: Optional[str] = None,
+    file_timeout: int = DEFAULT_FILE_TIMEOUT_SECONDS,
 ) -> BatchResult:
     """
     Convert multiple documents to markdown using multiprocessing.
@@ -949,6 +971,42 @@ def batch_convert(
             ncols=100,
             colour="green"
         )
+
+    def record_timeout(task, message: Optional[str] = None) -> None:
+        """Record a timed-out task and keep progress/checkpoints coherent."""
+        nonlocal completed_count
+        completed_count += 1
+        result.failed += 1
+        worker_pool.record_result(False)
+        timeout_message = message or f"Timeout (>{file_timeout}s)"
+        failed_dict[str(task[0])] = timeout_message
+        result.errors.append(
+            f"[timeout] {task[0]}: {timeout_message}"
+        )
+
+        if use_rich_progress and rich_progress:
+            rich_progress.advance(rich_task)
+            rconsole.print(
+                f"  [yellow]\u23f0[/yellow] "
+                f"[white]TIMEOUT: "
+                f"{Path(task[0]).name}[/white]"
+            )
+        elif TQDM_AVAILABLE and pbar:
+            pbar.update(1)
+            tqdm.write(
+                f"[{completed_count}/{total_tasks}] "
+                f"TIMEOUT: {Path(task[0]).name}"
+            )
+        else:
+            pct = (
+                completed_count / total_tasks
+            ) * 100
+            print(
+                f"[{pct:5.1f}%] "
+                f"[{completed_count}/{total_tasks}]"
+                f" TIMEOUT: {Path(task[0]).name}"
+            )
+        sys.stdout.flush()
     
     for batch_num in range(num_batches):
         batch_start = batch_num * batch_size
@@ -972,11 +1030,56 @@ def batch_convert(
                 executor.submit(convert_single_file, task): task
                 for task in batch
             }
-            
-            for future in as_completed(futures):
+            pending_futures = set(futures)
+            future_start_times = {
+                future: time.monotonic()
+                for future in pending_futures
+            }
+
+            while pending_futures:
+                done, _ = wait(
+                    pending_futures,
+                    timeout=1,
+                    return_when=FIRST_COMPLETED,
+                )
+
+                if not done:
+                    if file_timeout and file_timeout > 0:
+                        now = time.monotonic()
+                        expired = [
+                            future
+                            for future in pending_futures
+                            if now - future_start_times[future] >=
+                            file_timeout
+                        ]
+                        if expired:
+                            for future in expired:
+                                task = futures[future]
+                                record_timeout(task)
+                                pending_futures.remove(future)
+                                future.cancel()
+
+                            terminate_executor_workers(executor)
+
+                            for future in list(pending_futures):
+                                task = futures[future]
+                                record_timeout(
+                                    task,
+                                    (
+                                        "Worker pool stopped after "
+                                        "another file timed out"
+                                    ),
+                                )
+                                pending_futures.remove(future)
+                                future.cancel()
+                            break
+                    continue
+
+                future = next(iter(done))
+                pending_futures.remove(future)
                 completed_count += 1
                 try:
-                    conv_result = future.result(timeout=300)
+                    conv_result = future.result()
                     result.results.append(conv_result)
                     
                     if conv_result.success:
@@ -1094,36 +1197,9 @@ def batch_convert(
                     sys.stdout.flush()
                         
                 except TimeoutError:
-                    result.failed += 1
-                    worker_pool.record_result(False)
                     task = futures[future]
-                    failed_dict[str(task[0])] = "Timeout (>5min)"
-                    result.errors.append(
-                        f"[timeout] {task[0]}: Timeout (>5min)"
-                    )
-                    if use_rich_progress and rich_progress:
-                        rich_progress.advance(rich_task)
-                        rconsole.print(
-                            f"  [yellow]\u23f0[/yellow] "
-                            f"[white]TIMEOUT: "
-                            f"{Path(task[0]).name}[/white]"
-                        )
-                    elif TQDM_AVAILABLE and pbar:
-                        pbar.update(1)
-                        tqdm.write(
-                            f"[{completed_count}/{total_tasks}] "
-                            f"TIMEOUT: {Path(task[0]).name}"
-                        )
-                    else:
-                        pct = (
-                            completed_count / total_tasks
-                        ) * 100
-                        print(
-                            f"[{pct:5.1f}%] "
-                            f"[{completed_count}/{total_tasks}]"
-                            f" TIMEOUT: {Path(task[0]).name}"
-                        )
-                    sys.stdout.flush()
+                    completed_count -= 1
+                    record_timeout(task)
                 except Exception as e:
                     result.failed += 1
                     worker_pool.record_result(False)
@@ -1441,6 +1517,17 @@ Examples:
         action='store_true',
         help='Start with 2 workers, maximum caution'
     )
+
+    parser.add_argument(
+        '--file-timeout',
+        type=int,
+        default=DEFAULT_FILE_TIMEOUT_SECONDS,
+        help=(
+            'Maximum seconds to allow one file conversion before '
+            f'timing out (default: {DEFAULT_FILE_TIMEOUT_SECONDS}; '
+            'use 0 to disable)'
+        )
+    )
     
     args = parser.parse_args()
     
@@ -1489,6 +1576,7 @@ Examples:
             batch_size=args.batch_size,
             resume=args.resume,
             log_file=args.log_file,
+            file_timeout=args.file_timeout,
         )
         
         # Save report if requested
