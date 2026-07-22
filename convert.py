@@ -1,30 +1,17 @@
 #!/usr/bin/env python3
 """
-KingAI Markdown Converter v1.1
+KingAI Markdown Converter v1.2
 ==============================
-Batch document converter with quality metrics, multi-library fallback,
-and graceful degradation for large-scale document processing.
+Batch document converter with quality metrics, multi-library fallbacks,
+bounded per-file execution, and resumable large-collection processing.
 
-v1.1 adds:
-- Pre-flight file validation (magic bytes, min size)
-- Exponential backoff with Full Jitter on extractor failures
-- Batch chunking with checkpoints for crash recovery
-- File-based progress logging (survives terminal crashes)
-- --resume flag to continue from where you left off
-- Error classification (invalid_file, corrupt, timeout, etc.)
-- Adaptive worker scaling under memory pressure
-Will be adding 
-
-will be making a seperate script for testing different ocr and image to text scripts in a monte carlo method to see what handles what
-then will make a frontend (pyside6 qt5/6 and pyqt based) and cli version which matchs the functions of that. with confidence and more quality of life and testing sandbox 
-for image based pdfs to text like how algerbra is read. this will require a seperate github, maybe testers and contributers. i cant tests all edge cases. only on stuff i have access to.
-multiple outputs to compare what works better for what sort of diagrams. what needs manual checking even on the best method.  
-
-
+Version 1.2 adds legacy and OpenDocument conversion through LibreOffice,
+direct extraction of populated spreadsheet cells, RTF fragment recovery,
+and page-image preservation for PDFs that contain no extractable text.
 
 Author: Jason King (KingAI Pty Ltd)
 License: MIT
-Version: 1.1.0
+Version: 1.2.0
 """
 
 import argparse
@@ -34,16 +21,18 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
-import hashlib
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
-from math import ceil
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Tuple
+from urllib.parse import quote
 import multiprocessing
 import os as _os
 _os.environ.setdefault('PYMUPDF_SUGGEST_LAYOUT_ANALYZER', '0')
@@ -70,7 +59,6 @@ try:
         SpinnerColumn,
         TextColumn,
         BarColumn,
-        TaskProgressColumn,
         TimeRemainingColumn,
         TimeElapsedColumn,
         MofNCompleteColumn,
@@ -92,7 +80,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Version info
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Supported file extensions
 SUPPORTED_EXTENSIONS = {
@@ -103,6 +91,9 @@ SUPPORTED_EXTENSIONS = {
     '.xls': 'Legacy Excel Spreadsheet',
     '.pptx': 'PowerPoint Presentation',
     '.ppt': 'Legacy PowerPoint',
+    '.odt': 'OpenDocument Text',
+    '.ods': 'OpenDocument Spreadsheet',
+    '.odp': 'OpenDocument Presentation',
     '.epub': 'E-Book',
     '.html': 'HTML Document',
     '.htm': 'HTML Document',
@@ -118,7 +109,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 # --- v1.1: Pre-flight validation ---
-# Minimum file sizes (bytes) — files below this can't be valid
+# Minimum file sizes (bytes); files below this cannot be valid.
 MIN_FILE_SIZES = {
     '.pdf': 100,    # %PDF-1.0 header + %%EOF
     '.docx': 1000,  # ZIP archive minimum
@@ -210,6 +201,16 @@ def validate_file_preflight(file_path: Path) -> tuple:
                 f"{len(header)} < {read_size} bytes"
             )
         if not header.startswith(expected_magic):
+            if ext == '.rtf':
+                try:
+                    with open(file_path, 'rb') as f:
+                        fragment_start = f.read(4096)
+                        f.seek(max(0, size - 64))
+                        fragment_end = f.read()
+                    if b'\\par' in fragment_start and fragment_end.rstrip().endswith(b'}'):
+                        return True, "valid RTF body fragment"
+                except (IOError, OSError):
+                    pass
             return False, (
                 f"invalid {ext} header: expected "
                 f"{expected_magic!r}, got {header[:read_size]!r}"
@@ -419,11 +420,250 @@ def extract_with_markitdown(file_path: Path) -> Tuple[str, str]:
         from markitdown import MarkItDown
         md = MarkItDown()
         result = md.convert(str(file_path))
-        return result.markdown, "markitdown"
+        markdown = result.markdown
+        if not markdown or not markdown.strip():
+            raise RuntimeError("MarkItDown returned no text")
+        return markdown, "markitdown"
     except ImportError:
         raise
     except Exception as e:
         raise RuntimeError(f"MarkItDown failed: {e}")
+
+
+def find_libreoffice_executable() -> Optional[Path]:
+    """Find a usable LibreOffice command without requiring PATH changes."""
+    configured = os.environ.get("LIBREOFFICE_PATH")
+    candidates = [Path(configured)] if configured else []
+
+    for command in ("soffice", "libreoffice"):
+        found = shutil.which(command)
+        if found:
+            candidates.append(Path(found))
+
+    if os.name == "nt":
+        for root_name in ("ProgramFiles", "ProgramFiles(x86)"):
+            root = os.environ.get(root_name)
+            if root:
+                program_dir = Path(root) / "LibreOffice" / "program"
+                candidates.extend(
+                    [program_dir / "soffice.com", program_dir / "soffice.exe"]
+                )
+
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _markdown_cell(value) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        try:
+            value = value.isoformat()
+        except (TypeError, ValueError):
+            pass
+    return str(value).replace("|", "\\|").replace("\r\n", "<br>").replace("\n", "<br>")
+
+
+def _column_name(column_number: int) -> str:
+    name = ""
+    while column_number:
+        column_number, remainder = divmod(column_number - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def _render_sheet(name: str, rows) -> str:
+    populated_rows = [(number, values) for number, values in rows if values]
+    if not populated_rows:
+        return ""
+
+    columns = sorted(
+        {
+            column
+            for _, values in populated_rows
+            for column, value in values.items()
+            if value is not None
+        }
+    )
+    if not columns:
+        return ""
+
+    lines = [f"## Sheet: {name}", ""]
+    headers = ["Row", *(_column_name(column) for column in columns)]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join("---" for _ in headers) + " |")
+    for row_number, values in populated_rows:
+        rendered = [_markdown_cell(values.get(column)) for column in columns]
+        lines.append(f"| {row_number} | " + " | ".join(rendered) + " |")
+    return "\n".join(lines)
+
+
+def extract_spreadsheet_to_markdown(file_path: Path) -> Tuple[str, str]:
+    """Extract real populated cells without trusting inflated sheet dimensions."""
+    sections = []
+    extension = file_path.suffix.lower()
+
+    if extension == ".xlsx":
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(file_path, read_only=False, data_only=False)
+        try:
+            for worksheet in workbook.worksheets:
+                values_by_row = {}
+                for cell in worksheet._cells.values():
+                    if cell.value is not None:
+                        values_by_row.setdefault(cell.row, {})[cell.column] = cell.value
+                section = _render_sheet(
+                    worksheet.title,
+                    sorted(values_by_row.items()),
+                )
+                if section:
+                    sections.append(section)
+        finally:
+            workbook.close()
+        method = "openpyxl-populated-cells"
+    elif extension == ".xls":
+        import xlrd
+
+        workbook = xlrd.open_workbook(str(file_path), on_demand=True)
+        try:
+            for worksheet in workbook.sheets():
+                rows = []
+                for row_index in range(worksheet.nrows):
+                    values = {
+                        column_index + 1: worksheet.cell_value(row_index, column_index)
+                        for column_index in range(worksheet.ncols)
+                        if worksheet.cell_value(row_index, column_index) not in (None, "")
+                    }
+                    if values:
+                        rows.append((row_index + 1, values))
+                section = _render_sheet(worksheet.name, rows)
+                if section:
+                    sections.append(section)
+        finally:
+            workbook.release_resources()
+        method = "xlrd-populated-cells"
+    else:
+        raise ValueError(f"Direct spreadsheet extraction does not support {extension}")
+
+    if not sections:
+        raise RuntimeError("Spreadsheet contains no populated cells")
+    return "\n\n".join(sections), method
+
+
+def extract_rtf_to_markdown(file_path: Path) -> Tuple[str, str]:
+    """Extract normal RTF files and logger-produced RTF body fragments."""
+    from striprtf.striprtf import rtf_to_text
+
+    rtf_text = file_path.read_text(encoding="latin-1")
+    if not rtf_text.lstrip().startswith("{\\rtf"):
+        header = (
+            r"{\rtf1\ansi\deff0{\fonttbl{\f0 Courier New;}}"
+            r"{\colortbl;\red0\green0\blue0;\red0\green0\blue255;"
+            r"\red255\green0\blue0;}\f0 "
+        )
+        rtf_text = header + rtf_text
+
+    plain_text = rtf_to_text(rtf_text).strip()
+    if not plain_text:
+        raise RuntimeError("RTF extraction returned no text")
+    return f"```text\n{plain_text}\n```", "striprtf"
+
+
+def render_pdf_pages_to_markdown(
+    file_path: Path,
+    output_path: Path,
+) -> Tuple[str, str]:
+    """Preserve image-only PDFs as page images linked from Markdown."""
+    import fitz
+
+    asset_dir = output_path.parent / f"{output_path.stem}_assets"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# {file_path.name}",
+        "",
+        "> No extractable text was found. Pages are preserved as images.",
+        "",
+    ]
+
+    with fitz.open(file_path) as document:
+        if document.page_count == 0:
+            raise RuntimeError("PDF has no pages to render")
+        for page_number, page in enumerate(document, 1):
+            image_name = f"page_{page_number:04d}.png"
+            image_path = asset_dir / image_name
+            temp_path = asset_dir / f".{image_name}.tmp.png"
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pixmap.save(str(temp_path))
+            temp_path.replace(image_path)
+            relative_image = f"{quote(asset_dir.name)}/{quote(image_name)}"
+            lines.extend(
+                [
+                    f"## Page {page_number}",
+                    "",
+                    f"![Page {page_number}]({relative_image})",
+                    "",
+                ]
+            )
+
+    return "\n".join(lines), "pymupdf-page-images"
+
+
+def extract_with_libreoffice(file_path: Path) -> Tuple[str, str]:
+    """Convert legacy/OpenDocument Office files, then extract the modern file."""
+    executable = find_libreoffice_executable()
+    if not executable:
+        raise RuntimeError(
+            "LibreOffice was not found; install it or set LIBREOFFICE_PATH"
+        )
+
+    target_extensions = {
+        ".doc": "docx",
+        ".odt": "docx",
+        ".rtf": "docx",
+        ".xls": "xlsx",
+        ".ods": "xlsx",
+        ".ppt": "pptx",
+        ".odp": "pptx",
+    }
+    target_extension = target_extensions.get(file_path.suffix.lower())
+    if not target_extension:
+        raise ValueError(f"LibreOffice fallback does not support {file_path.suffix}")
+
+    with tempfile.TemporaryDirectory(prefix="kingai_libreoffice_") as temp_dir:
+        temp_path = Path(temp_dir)
+        profile_path = temp_path / "profile"
+        profile_path.mkdir()
+        command = [
+            str(executable),
+            f"-env:UserInstallation={profile_path.as_uri()}",
+            "--headless",
+            "--convert-to",
+            target_extension,
+            "--outdir",
+            str(temp_path),
+            str(file_path),
+        ]
+        run_options = {
+            "capture_output": True,
+            "text": True,
+            "timeout": 120,
+            "check": False,
+        }
+        if os.name == "nt":
+            run_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        completed = subprocess.run(command, **run_options)
+        converted_path = temp_path / f"{file_path.stem}.{target_extension}"
+        if completed.returncode != 0 or not converted_path.is_file():
+            detail = (completed.stderr or completed.stdout or "no output").strip()
+            raise RuntimeError(
+                f"LibreOffice conversion failed ({completed.returncode}): {detail}"
+            )
+
+        if target_extension == "xlsx":
+            markdown, method = extract_spreadsheet_to_markdown(converted_path)
+        else:
+            markdown, method = extract_with_markitdown(converted_path)
+        return markdown, f"libreoffice-{target_extension}+{method}"
 
 
 def extract_with_pymupdf4llm(file_path: Path) -> Tuple[str, str]:
@@ -431,15 +671,15 @@ def extract_with_pymupdf4llm(file_path: Path) -> Tuple[str, str]:
     
     If pymupdf-layout is installed, activates its ONNX-based document
     layout analyzer for improved page structure detection. The layout
-    package must be imported BEFORE pymupdf4llm to activate — pymupdf
+    package must be imported BEFORE pymupdf4llm to activate; pymupdf
     does not auto-import its own subpackage.
     """
     try:
         # Activate ONNX layout analyzer if available (must happen before pymupdf4llm import)
         try:
-            import pymupdf.layout  # noqa: F401 — side-effect: sets pymupdf._get_layout
+            import pymupdf.layout  # noqa: F401 - sets pymupdf._get_layout
         except ImportError:
-            pass  # pymupdf-layout not installed — uses standard layout analysis
+            pass  # pymupdf-layout is optional; use standard layout analysis.
         import pymupdf4llm
         md_text = pymupdf4llm.to_markdown(str(file_path))
         method = "pymupdf4llm+layout" if hasattr(pymupdf4llm, 'parse_document') else "pymupdf4llm"
@@ -454,7 +694,7 @@ def extract_with_pymupdf(file_path: Path) -> Tuple[str, str]:
     """Extract using PyMuPDF directly"""
     try:
         try:
-            import pymupdf.layout  # noqa: F401 — suppress layout warning
+            import pymupdf.layout  # noqa: F401 - suppress layout warning
         except ImportError:
             pass
         import pymupdf
@@ -533,7 +773,10 @@ def convert_pdf_with_best_quality(
             raise RuntimeError(
                 f"All extractors failed: {'; '.join(errors)}"
             )
-        raise ImportError("No PDF extraction library installed")
+        raise RuntimeError(
+            "PDF extractors returned no text; the document may be "
+            "image-only, empty, or require OCR"
+        )
     
     # Return result with highest word count
     best = max(results, key=lambda x: x[1].word_count)
@@ -589,17 +832,68 @@ def convert_single_file(
         ext = input_path.suffix.lower()
         
         if ext == '.pdf':
-            # Use best PDF extraction with fallback
-            markdown_text, quality = convert_pdf_with_best_quality(
-                input_path, verbose
-            )
+            try:
+                markdown_text, quality = convert_pdf_with_best_quality(
+                    input_path, verbose
+                )
+            except RuntimeError as extraction_error:
+                try:
+                    markdown_text, method = render_pdf_pages_to_markdown(
+                        input_path,
+                        output_path,
+                    )
+                except Exception as render_error:
+                    raise RuntimeError(
+                        f"PDF text extraction failed: {extraction_error}; "
+                        f"page rendering failed: {render_error}"
+                    ) from render_error
+                quality = calculate_quality_metrics(markdown_text, method)
+        elif ext == '.xlsx':
+            try:
+                markdown_text, method = extract_spreadsheet_to_markdown(input_path)
+            except Exception as primary_error:
+                try:
+                    markdown_text, method = extract_with_markitdown(input_path)
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"Spreadsheet extraction failed: {primary_error}; "
+                        f"MarkItDown fallback failed: {fallback_error}"
+                    ) from fallback_error
+            quality = calculate_quality_metrics(markdown_text, method)
+        elif ext == '.xls':
+            try:
+                markdown_text, method = extract_spreadsheet_to_markdown(input_path)
+            except Exception:
+                markdown_text, method = extract_with_libreoffice(input_path)
+            quality = calculate_quality_metrics(markdown_text, method)
+        elif ext == '.rtf':
+            try:
+                markdown_text, method = extract_rtf_to_markdown(input_path)
+            except Exception as primary_error:
+                try:
+                    markdown_text, method = extract_with_libreoffice(input_path)
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"RTF extraction failed: {primary_error}; "
+                        f"LibreOffice fallback failed: {fallback_error}"
+                    ) from fallback_error
+            quality = calculate_quality_metrics(markdown_text, method)
+        elif ext in {'.doc', '.odt', '.ods', '.ppt', '.odp'}:
+            try:
+                markdown_text, method = extract_with_markitdown(input_path)
+            except Exception as primary_error:
+                try:
+                    markdown_text, method = extract_with_libreoffice(input_path)
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"Primary extraction failed: {primary_error}; "
+                        f"LibreOffice fallback failed: {fallback_error}"
+                    ) from fallback_error
+            quality = calculate_quality_metrics(markdown_text, method)
         else:
             # Use MarkItDown for other formats
-            from markitdown import MarkItDown
-            md = MarkItDown()
-            result = md.convert(str(input_path))
-            markdown_text = result.markdown
-            quality = calculate_quality_metrics(markdown_text, "markitdown")
+            markdown_text, method = extract_with_markitdown(input_path)
+            quality = calculate_quality_metrics(markdown_text, method)
         
         # Write output with metadata header
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -676,7 +970,7 @@ def find_documents(
             continue
         
         # Default directories to always skip (massive and never contain docs)
-        _ALWAYS_SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv',
+        _ALWAYS_SKIP_DIRS = {'.git', '.vs', 'node_modules', '__pycache__', '.venv', 'venv',
                              '.tox', '.mypy_cache', '.pytest_cache', '.eggs',
                              '.hg', '.svn', '.bzr'}
         
@@ -860,10 +1154,17 @@ def batch_convert(
             doc_path, output_path, preserve_structure, base_dir
         )
         
-        # Skip if already done (resume mode)
+        # A checkpoint is only valid while its expected output still exists.
+        # This also repairs checkpoints left inconsistent by interrupted or
+        # overlapping conversion runs.
         if str(doc_path) in completed_paths_set:
-            result.skipped += 1
-            continue
+            if out_path.exists():
+                result.skipped += 1
+                continue
+            completed_paths_set.discard(str(doc_path))
+            logger.warning(
+                f"Checkpoint output missing; retrying: {doc_path.name}"
+            )
         
         # Skip if output exists and not overwriting
         if out_path.exists() and not overwrite:
@@ -896,6 +1197,18 @@ def batch_convert(
     
     # v1.1: Adaptive worker pool
     worker_pool = AdaptiveWorkerPool(num_workers)
+
+    # A future's timeout clock starts when it is submitted. Keep each pool
+    # wave no larger than the worker count so queued documents cannot expire
+    # before a worker has had a chance to open them.
+    requested_batch_size = batch_size
+    batch_size = max(1, min(batch_size, num_workers))
+    if batch_size != requested_batch_size:
+        logger.info(
+            "Capped execution wave from "
+            f"{requested_batch_size} to {batch_size} files "
+            "to preserve per-file timeout semantics"
+        )
     
     logger.info(
         f"Converting {len(tasks)} files with "
@@ -935,8 +1248,6 @@ def batch_convert(
     failed_dict = {}
     total_tasks = len(tasks)
     completed_count = 0
-    num_batches = ceil(total_tasks / batch_size)
-    
     # Set up progress display
     use_rich_progress = RICH_AVAILABLE
     rich_progress = None
@@ -987,7 +1298,7 @@ def batch_convert(
         if use_rich_progress and rich_progress:
             rich_progress.advance(rich_task)
             rconsole.print(
-                f"  [yellow]\u23f0[/yellow] "
+                f"  [yellow]TIMEOUT[/yellow] "
                 f"[white]TIMEOUT: "
                 f"{Path(task[0]).name}[/white]"
             )
@@ -1008,20 +1319,21 @@ def batch_convert(
             )
         sys.stdout.flush()
     
-    for batch_num in range(num_batches):
-        batch_start = batch_num * batch_size
-        batch_end = min(batch_start + batch_size, total_tasks)
-        batch = tasks[batch_start:batch_end]
-        
-        if num_batches > 1:
-            logger.info(
-                f"Batch {batch_num + 1}/{num_batches}: "
-                f"files {batch_start + 1}-{batch_end} "
-                f"of {total_tasks}"
-            )
-        
-        # Adjust workers based on failure rate
+    batch_start = 0
+    wave_num = 0
+    while batch_start < total_tasks:
+        # Recalculate each wave after the previous results so adaptive worker
+        # reductions never leave queued files aging against their timeout.
         adj_workers = worker_pool.get_adjusted_workers()
+        wave_size = max(1, min(batch_size, adj_workers))
+        batch_end = min(batch_start + wave_size, total_tasks)
+        batch = tasks[batch_start:batch_end]
+        wave_num += 1
+
+        logger.info(
+            f"Wave {wave_num}: files {batch_start + 1}-{batch_end} "
+            f"of {total_tasks} with {adj_workers} worker(s)"
+        )
         
         with ProcessPoolExecutor(
             max_workers=adj_workers
@@ -1147,13 +1459,13 @@ def batch_convert(
                                 "Skipped" not in \
                                 conv_result.error_message:
                             rconsole.print(
-                                f"  [green]\u2713[/green] "
+                                f"  [green]OK[/green] "
                                 f"[white]{status}[/white] "
                                 f"[dim]{detail.strip()}[/dim]"
                             )
                         elif not conv_result.success:
                             rconsole.print(
-                                f"  [red]\u2717[/red] "
+                                f"  [red]FAIL[/red] "
                                 f"[white]{status}[/white] "
                                 f"[dim]{detail.strip()}[/dim]"
                             )
@@ -1211,7 +1523,7 @@ def batch_convert(
                     if use_rich_progress and rich_progress:
                         rich_progress.advance(rich_task)
                         rconsole.print(
-                            f"  [red]\u2717[/red] "
+                            f"  [red]FAIL[/red] "
                             f"[white]ERROR: "
                             f"{Path(task[0]).name}[/white] "
                             f"[dim]{str(e)[:50]}[/dim]"
@@ -1246,12 +1558,14 @@ def batch_convert(
         gc.collect()
         
         # Log memory usage between batches
-        if PSUTIL_AVAILABLE and num_batches > 1:
+        if PSUTIL_AVAILABLE and total_tasks > batch_size:
             mem = psutil.virtual_memory()
             logger.info(
                 f"Memory: {mem.percent}% used "
                 f"({mem.available / 1_073_741_824:.1f}GB free)"
             )
+
+        batch_start = batch_end
     
     # Close progress display
     if use_rich_progress and rich_progress:
@@ -1404,7 +1718,7 @@ def save_report(result: BatchResult, output_path: str):
 def main():
     parser = argparse.ArgumentParser(
         description="""
-KingAI Markdown Converter v1.1 - Batch document conversion
+KingAI Markdown Converter v1.2 - Batch document conversion
 
 Converts PDF, DOCX, XLSX, PPTX, and more to Markdown.
 Uses multiprocessing with graceful degradation for large runs.
@@ -1420,7 +1734,7 @@ Examples:
     
     parser.add_argument(
         'input_dirs',
-        nargs='+',
+        nargs='*',
         help='Input directories or files to convert'
     )
     
@@ -1547,12 +1861,18 @@ Examples:
             rconsole.print(tbl)
             rconsole.print()
         else:
-            print("\n📄 Supported File Extensions:")
+            print("\nSupported File Extensions:")
             print("=" * 40)
             for ext, desc in sorted(SUPPORTED_EXTENSIONS.items()):
                 print(f"  {ext:8} - {desc}")
             print()
         return 0
+
+    if not args.input_dirs:
+        parser.error(
+            "at least one input directory or file is required unless "
+            "--list-extensions is used"
+        )
     
     # Run batch conversion
     try:
