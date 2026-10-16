@@ -90,6 +90,17 @@ they begin processing.
 
 ## Existing Output and Resume Rules
 
+- Before any output directory or progress log is created, the converter checks
+  all requested output paths for collisions and source aliases. Two input files
+  such as `same.pdf` and `same.docx` cannot both write `same.md`.
+- A source `.md` file is never its own output, even with `--overwrite`.
+  Symlink aliases are also refused. Give converted Markdown sources a separate,
+  non-colliding destination or exclude them.
+- An output collision is a fail-closed planning error (`output_collision`);
+  **no conversions are launched**, including unrelated files in the same batch.
+  Resolve duplicate stems or use separate output folders.
+- `--dry-run` neither creates output directories nor writes progress logs or
+  checkpoints. Explicit `--report` still writes the requested JSON report.
 - Without `--overwrite`, an existing destination `.md` file is skipped.
 - `--resume` loads `.convert_checkpoint.json` from the output folder.
 - A checkpoint entry is trusted only while its expected Markdown file exists.
@@ -119,9 +130,9 @@ mostly empty Markdown tables caused by stale worksheet dimensions.
 
 ## Error Handling
 
-Reports classify failures as `invalid_file`, `corrupt_file`,
+Reports classify conversion failures as `invalid_file`, `corrupt_file`,
 `extractor_crash`, `timeout`, `memory_error`, `dependency_missing`, or
-`permission_error`. Zero-byte and obviously invalid files fail pre-flight
+`permission_error`; output planning adds `output_collision`. Zero-byte and obviously invalid files fail pre-flight
 without being sent through every parser.
 
 When one worker exceeds its timeout, that worker pool is stopped. Other files in
