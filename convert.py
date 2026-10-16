@@ -116,6 +116,14 @@ MIN_FILE_SIZES = {
     '.doc': 512,    # OLE2 compound doc header
     '.xlsx': 1000,
     '.pptx': 1000,
+    # Short plain-text documents are valid inputs; 50-byte default applies only
+    # to other formats without an explicit signature/minimum.
+    '.txt': 1,
+    '.md': 1,
+    '.csv': 1,
+    '.html': 1,
+    '.htm': 1,
+    '.rtf': 5,
 }
 DEFAULT_MIN_SIZE = 50  # catch zero-byte files
 
@@ -798,6 +806,17 @@ def convert_single_file(
     output_path = Path(output_path)
     
     try:
+        # Never let a direct conversion overwrite its own source, even when
+        # --overwrite is explicitly provided or the output is a symlink.
+        if _canonical_path_key(input_path) == _canonical_path_key(output_path):
+            return ConversionResult(
+                input_path=str(input_path),
+                output_path=str(output_path),
+                success=False,
+                error_message="Output path aliases input; source must not be overwritten",
+                conversion_time=time.time() - start_time,
+            )
+
         # Check if output already exists
         if output_path.exists() and not overwrite:
             return ConversionResult(
@@ -1047,6 +1066,11 @@ def get_output_path(
     return output_path
 
 
+def _canonical_path_key(path: Path) -> str:
+    """Resolve existing symlinks and platform-specific case aliases."""
+    return os.path.normcase(str(Path(path).resolve()))
+
+
 def terminate_executor_workers(executor: ProcessPoolExecutor) -> None:
     """Best-effort hard stop for workers stuck inside third-party parsers."""
     terminate_workers = getattr(executor, "terminate_workers", None)
@@ -1103,21 +1127,67 @@ def batch_convert(
     
     logger.info(f"Found {len(documents)} documents to process")
     
-    # Prepare output directory
+    # Build the complete output plan before creating files or log folders.
+    # foo.pdf and foo.docx both become foo.md; .md input can also alias its
+    # own output. Neither --overwrite nor --resume may silently destroy a
+    # source or make two workers target one destination.
     output_path = Path(output_dir) if output_dir else None
-    if output_path:
+    base_dir = Path(input_dirs[0]) if preserve_structure and len(input_dirs) == 1 else None
+    blocked_sources = set()
+    output_conflicts = []
+    try:
+        source_owners = {}
+        for document in documents:
+            source_owners.setdefault(_canonical_path_key(document), document)
+        output_owners = {}
+        for document in documents:
+            destination = get_output_path(
+                document, output_path, preserve_structure, base_dir
+            )
+            destination_key = _canonical_path_key(destination)
+            source_owner = source_owners.get(destination_key)
+            if source_owner is not None:
+                blocked_sources.update((str(document), str(source_owner)))
+                output_conflicts.append(
+                    f"Output {destination} aliases input {source_owner} "
+                    f"(requested by {document})"
+                )
+            previous_owner = output_owners.get(destination_key)
+            if previous_owner is not None:
+                blocked_sources.update((str(document), str(previous_owner)))
+                output_conflicts.append(
+                    f"Output collision at {destination}: "
+                    f"{previous_owner} and {document}"
+                )
+            else:
+                output_owners[destination_key] = document
+    except (OSError, RuntimeError, ValueError) as exc:
+        blocked_sources.add(str(documents[0]))
+        output_conflicts.append(f"Cannot validate output paths: {exc}")
+
+    if output_conflicts:
+        result.failed = len(blocked_sources)
+        result.errors.extend(
+            f"[output_collision] {message}" for message in output_conflicts
+        )
+        for message in output_conflicts:
+            logger.error(message)
+        result.total_time = time.time() - start_time
+        return result
+
+    # A dry-run only inspects inputs and plans work. It does not create an
+    # output directory, progress log, or checkpoint. --report remains an
+    # explicit caller-controlled output outside batch_convert().
+    if output_path and not dry_run:
         output_path.mkdir(parents=True, exist_ok=True)
-    
-    # v1.1: Set up file-based logging
-    if log_file or output_path:
+
+    if not dry_run and (log_file or output_path):
         log_path = Path(log_file) if log_file else (
             output_path / "conversion_progress.log"
         )
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            fh = logging.FileHandler(
-                str(log_path), encoding='utf-8'
-            )
+            fh = logging.FileHandler(str(log_path), encoding='utf-8')
             fh.setFormatter(logging.Formatter(
                 '%(asctime)s | %(levelname)-7s | %(message)s',
                 datefmt='%Y-%m-%d %H:%M:%S'
@@ -1126,12 +1196,7 @@ def batch_convert(
             logger.info(f"Logging to: {log_path}")
         except OSError:
             pass  # file logging is best-effort
-    
-    # Determine base directory for structure preservation
-    base_dir = None
-    if preserve_structure and len(input_dirs) == 1:
-        base_dir = Path(input_dirs[0])
-    
+
     # v1.1: Checkpoint for resume
     checkpoint_path = None
     completed_paths_set = set()
