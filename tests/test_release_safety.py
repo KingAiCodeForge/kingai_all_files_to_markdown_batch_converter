@@ -12,6 +12,18 @@ import convert
 
 
 class ReleaseSafetyTests(unittest.TestCase):
+    def test_output_file_directory_overlap_blocks_entire_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "input"
+            root.mkdir()
+            (root / "same.txt").write_text("first source", encoding="utf-8")
+            (root / "same.md").mkdir()
+            (root / "same.md" / "nested.txt").write_text("second source", encoding="utf-8")
+            output = Path(tmp) / "output"
+            result = convert.batch_convert([str(root)], extensions=["txt"], output_dir=str(output))
+            self.assertGreater(result.failed, 0)
+            self.assertFalse(output.exists())
+
     def test_worker_error_strings_keep_actionable_categories(self):
         self.assertEqual(convert.classify_error(Exception("Missing dependency: synthetic")), "dependency_missing")
         self.assertEqual(convert.classify_error(Exception("Pre-flight: too small")), "invalid_file")

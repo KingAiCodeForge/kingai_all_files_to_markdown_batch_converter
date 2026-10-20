@@ -1246,6 +1246,16 @@ def batch_convert(
         if report_file and not Path(report_file).parent.is_dir():
             raise ValueError("Report parent directory must already exist")
         destinations = [get_output_path(d, output_path, preserve_structure, base_dir) for d in documents]
+        planned_files = destinations + auxiliary
+        file_locations = {_canonical_path_key(p) for p in planned_files + documents + supplied_files}
+        for planned in planned_files:
+            if planned.exists() and not planned.is_file():
+                raise ValueError(f"Output is not a regular file: {planned}")
+            for parent in planned.resolve().parents:
+                if os.path.normcase(str(parent)) in file_locations:
+                    raise ValueError(f"Output file is also required as a directory: {parent}")
+                if parent.exists() and not parent.is_dir():
+                    raise ValueError(f"Output parent is not a directory: {parent}")
         for index, auxiliary_path in enumerate(auxiliary):
             if auxiliary_path.exists() and not auxiliary_path.is_file():
                 raise ValueError(f"Auxiliary output is not a regular file: {auxiliary_path}")
