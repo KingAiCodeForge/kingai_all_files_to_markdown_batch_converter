@@ -41,8 +41,7 @@ desktop.ini
 
 # Test outputs
 test_output_*/
-test_*.py
-tests/
+# Synthetic regression tests are public reusable source.
 conversion_reports/
 *.log
 
@@ -67,3 +66,11 @@ document_converter*.py
 batch_converter.py
 run_*.py
 test_converter.py
+
+# Local source documents, conversion state and credentials stay private.
+.env
+.env.*
+!.env.example
+.convert_checkpoint.json
+*_assets/
+local_config.*

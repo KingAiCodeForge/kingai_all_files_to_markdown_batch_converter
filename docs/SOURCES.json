@@ -1,0 +1,11 @@
+{
+  "repository": "KingAiCodeForge/kingai_all_files_to_markdown_batch_converter",
+  "visibility": "public",
+  "original_default": {"branch": "main", "commit": "02cf4489285c208fff4d61d31448cb1881b421fb", "preserved_ref": "preserve/main-20261020"},
+  "integrated_pr": {"number": 1, "branch": "review/output-collision-and-dryrun-safety-20261017", "commit": "0f2d71fb5de33f4ef3e8a38cf5eca9500711c414", "preserved_ref": "preserve/pr-1-20261020"},
+  "integration_branch": "integrate/public-safety-20261020",
+  "historical_variants": "All original public Git commits and branch refs are retained; no duplicate variant source was needed.",
+  "excluded_local_material": "No ignored documents, local configuration, customer inputs or private repository files were imported.",
+  "formerly_ignored_allowlist": ["tests/test_conversion_path_safety.py", "tests/test_release_safety.py", "tests/test_extractors.py"],
+  "allowlist_provenance": "The PR's public MIT regression source plus newly authored synthetic fixtures and tests. No production document contents."
+}
