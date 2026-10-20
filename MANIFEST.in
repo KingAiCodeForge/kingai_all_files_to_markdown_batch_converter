@@ -1,0 +1,4 @@
+include LICENSE README.md requirements.txt convert.bat
+recursive-include tests *.py
+recursive-include docs *.md *.json
+include kingai_image_to_markdown_ocr_pytesseract_comparer_tool/readme.md

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KingAI Markdown Converter v1.2
+KingAI Markdown Converter v1.3
 ==============================
 Batch document converter with quality metrics, multi-library fallbacks,
 bounded per-file execution, and resumable large-collection processing.
@@ -11,11 +11,12 @@ and page-image preservation for PDFs that contain no extractable text.
 
 Author: Jason King (KingAI Pty Ltd)
 License: MIT
-Version: 1.2.0
+Version: 1.3.0
 """
 
 import argparse
 import gc
+import functools
 import json
 import logging
 import os
@@ -80,7 +81,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Version info
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Supported file extensions
 SUPPORTED_EXTENSIONS = {
@@ -116,6 +117,14 @@ MIN_FILE_SIZES = {
     '.doc': 512,    # OLE2 compound doc header
     '.xlsx': 1000,
     '.pptx': 1000,
+    # Short plain-text documents are valid inputs; 50-byte default applies only
+    # to other formats without an explicit signature/minimum.
+    '.txt': 1,
+    '.md': 1,
+    '.csv': 1,
+    '.html': 1,
+    '.htm': 1,
+    '.rtf': 5,
 }
 DEFAULT_MIN_SIZE = 50  # catch zero-byte files
 
@@ -155,8 +164,10 @@ def classify_error(error: Exception) -> str:
         return ErrorClass.MEMORY_ERROR
     if isinstance(error, PermissionError):
         return ErrorClass.PERMISSION_ERROR
-    if isinstance(error, ImportError):
+    if isinstance(error, ImportError) or "missing dependency" in msg:
         return ErrorClass.DEPENDENCY_MISSING
+    if msg.startswith("pre-flight:"):
+        return ErrorClass.INVALID_FILE
     if "header" in msg or "magic" in msg or "not a pdf" in msg:
         return ErrorClass.INVALID_FILE
     if "corrupt" in msg or "damaged" in msg or "truncated" in msg:
@@ -280,6 +291,7 @@ class AdaptiveWorkerPool:
             new = self.initial_workers
             level = "NORMAL"
 
+        new = min(new, self.initial_workers)
         if new != self.current_workers:
             logger.warning(
                 f"Worker adjustment: {self.current_workers} -> "
@@ -295,7 +307,13 @@ def load_checkpoint(checkpoint_path: Path) -> dict:
     if checkpoint_path.exists():
         try:
             with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+                if not isinstance(data, dict):
+                    return {}
+                completed = data.get("completed_paths", [])
+                if not isinstance(completed, list) or not all(isinstance(p, str) for p in completed):
+                    return {}
+                return data
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
@@ -318,8 +336,7 @@ def save_checkpoint(
         "failed_paths": failed,
     }
     try:
-        with open(checkpoint_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        _write_text_atomic(checkpoint_path, json.dumps(data, indent=2, ensure_ascii=False))
     except OSError:
         pass  # checkpoint is best-effort
 
@@ -375,7 +392,7 @@ class BatchResult:
 def get_optimal_workers(max_workers: Optional[int] = None) -> int:
     """
     Get optimal number of worker processes for the system.
-    Optimized for i9-9900K (8 cores / 16 threads)
+    Uses the available CPU count with a memory-conscious cap.
     """
     cpu_count = multiprocessing.cpu_count()
     
@@ -577,7 +594,9 @@ def render_pdf_pages_to_markdown(
     import fitz
 
     asset_dir = output_path.parent / f"{output_path.stem}_assets"
-    asset_dir.mkdir(parents=True, exist_ok=True)
+    # Existing assets may be original inputs or a previous complete export.
+    # Never silently replace their page images, even under --overwrite.
+    asset_dir.mkdir(parents=True, exist_ok=False)
     lines = [
         f"# {file_path.name}",
         "",
@@ -641,7 +660,7 @@ def extract_with_libreoffice(file_path: Path) -> Tuple[str, str]:
             target_extension,
             "--outdir",
             str(temp_path),
-            str(file_path),
+            str(file_path.resolve()),
         ]
         run_options = {
             "capture_output": True,
@@ -798,6 +817,17 @@ def convert_single_file(
     output_path = Path(output_path)
     
     try:
+        # Never let a direct conversion overwrite its own source, even when
+        # --overwrite is explicitly provided or the output is a symlink.
+        if _paths_alias(input_path, output_path):
+            return ConversionResult(
+                input_path=str(input_path),
+                output_path=str(output_path),
+                success=False,
+                error_message="Output path aliases input; source must not be overwritten",
+                conversion_time=time.time() - start_time,
+            )
+
         # Check if output already exists
         if output_path.exists() and not overwrite:
             return ConversionResult(
@@ -896,14 +926,14 @@ def convert_single_file(
             quality = calculate_quality_metrics(markdown_text, method)
         
         # Write output with metadata header
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(f"<!-- Converted from: {input_path.name} -->\n")
-            f.write(f"<!-- Converted at: {datetime.now().isoformat()} -->\n")
-            f.write(f"<!-- Method: {quality.extraction_method} -->\n")
-            f.write(f"<!-- Words: {quality.word_count} | ")
-            f.write(f"Chars: {quality.char_count} | ")
-            f.write(f"Lines: {quality.line_count} -->\n\n")
-            f.write(markdown_text)
+        content = (
+            f"<!-- Converted from: {input_path.name} -->\n"
+            f"<!-- Converted at: {datetime.now().isoformat()} -->\n"
+            f"<!-- Method: {quality.extraction_method} -->\n"
+            f"<!-- Words: {quality.word_count} | Chars: {quality.char_count} | "
+            f"Lines: {quality.line_count} -->\n\n{markdown_text}"
+        )
+        _write_text_atomic(output_path, content, overwrite=overwrite)
         
         conversion_time = time.time() - start_time
         output_size = output_path.stat().st_size
@@ -1017,7 +1047,8 @@ def find_documents(
                 if not skip:
                     documents.append(file_path)
     
-    return documents
+    # Overlapping input roots must not schedule the same file twice.
+    return list({ _canonical_path_key(p): p for p in documents }.values())
 
 
 def get_output_path(
@@ -1031,7 +1062,7 @@ def get_output_path(
     Default: Output goes next to original file with .md extension.
     """
     if output_dir:
-        if preserve_structure and base_dir:
+        if preserve_structure and base_dir and base_dir != input_path:
             # Preserve relative directory structure
             try:
                 relative_path = input_path.relative_to(base_dir)
@@ -1045,6 +1076,59 @@ def get_output_path(
         output_path = input_path.with_suffix('.md')
     
     return output_path
+
+
+def _canonical_path_key(path: Path) -> str:
+    """Resolve existing symlinks and platform-specific case aliases."""
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+def _path_keys(path: Path) -> set:
+    keys = {("path", _canonical_path_key(path))}
+    try:
+        info = Path(path).stat()
+        if info.st_ino:
+            keys.add(("inode", info.st_dev, info.st_ino))
+    except FileNotFoundError:
+        pass
+    return keys
+
+
+def _paths_alias(first: Path, second: Path) -> bool:
+    """Compare resolved names and existing hardlinks before any output write."""
+    return bool(_path_keys(first) & _path_keys(second))
+
+
+def _write_text_atomic(path: Path, content: str, overwrite: bool = True):
+    """Publish complete text without truncating an existing file on failure."""
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            # Atomic no-clobber publication. Unsupported filesystems fail closed.
+            os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _close_batch_logs(function):
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        before = set(logger.handlers)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            for handler in set(logger.handlers) - before:
+                logger.removeHandler(handler)
+                handler.close()
+    return wrapped
 
 
 def terminate_executor_workers(executor: ProcessPoolExecutor) -> None:
@@ -1067,6 +1151,7 @@ def terminate_executor_workers(executor: ProcessPoolExecutor) -> None:
         process.join(timeout=2)
 
 
+@_close_batch_logs
 def batch_convert(
     input_dirs: List[str],
     output_dir: Optional[str] = None,
@@ -1082,6 +1167,7 @@ def batch_convert(
     resume: bool = False,
     log_file: Optional[str] = None,
     file_timeout: int = DEFAULT_FILE_TIMEOUT_SECONDS,
+    report_file: Optional[str] = None,
 ) -> BatchResult:
     """
     Convert multiple documents to markdown using multiprocessing.
@@ -1089,6 +1175,13 @@ def batch_convert(
     """
     start_time = time.time()
     result = BatchResult()
+
+    if not input_dirs or any(not Path(root).exists() for root in input_dirs):
+        raise ValueError("Every input file or directory must exist")
+    if max_workers is not None and max_workers < 1:
+        raise ValueError("workers must be at least 1")
+    if batch_size < 1 or file_timeout < 0:
+        raise ValueError("batch size must be positive and file timeout non-negative")
     
     # Find all documents
     logger.info("Scanning for documents...")
@@ -1097,27 +1190,120 @@ def batch_convert(
     )
     result.total_files = len(documents)
     
+    logger.info(f"Found {len(documents)} documents to process")
+    
+    # Build the complete output plan before creating files or log folders.
+    # foo.pdf and foo.docx both become foo.md; .md input can also alias its
+    # own output. Neither --overwrite nor --resume may silently destroy a
+    # source or make two workers target one destination.
+    output_path = Path(output_dir) if output_dir else None
+    base_dir = Path(input_dirs[0]) if preserve_structure and len(input_dirs) == 1 else None
+    supplied_files = [Path(root) for root in input_dirs if Path(root).is_file()]
+    blocked_sources = set()
+    output_conflicts = []
+    try:
+        source_owners = {}
+        for document in list(dict.fromkeys(documents + supplied_files)):
+            for key in _path_keys(document):
+                source_owners.setdefault(key, document)
+        output_owners = {}
+        for document in documents:
+            destination = get_output_path(
+                document, output_path, preserve_structure, base_dir
+            )
+            destination_key = _canonical_path_key(destination)
+            source_owner = next((source_owners[k] for k in _path_keys(destination) if k in source_owners), None)
+            if source_owner is not None:
+                blocked_sources.update((str(document), str(source_owner)))
+                output_conflicts.append(
+                    f"Output {destination} aliases input {source_owner} "
+                    f"(requested by {document})"
+                )
+            previous_owner = output_owners.get(destination_key)
+            if previous_owner is not None:
+                blocked_sources.update((str(document), str(previous_owner)))
+                output_conflicts.append(
+                    f"Output collision at {destination}: "
+                    f"{previous_owner} and {document}"
+                )
+            else:
+                output_owners[destination_key] = document
+
+        # Reports, logs and checkpoints are outputs too. Validate them before
+        # launching a worker or opening a log; dry-run reports obey the same rule.
+        auxiliary = []
+        if report_file:
+            auxiliary.append(Path(report_file))
+        if not dry_run:
+            if log_file:
+                auxiliary.append(Path(log_file))
+            elif output_path:
+                auxiliary.append(output_path / "conversion_progress.log")
+            if output_path:
+                auxiliary.append(output_path / ".convert_checkpoint.json")
+        if output_path and output_path.exists() and not output_path.is_dir():
+            raise ValueError(f"Output directory is a file: {output_path}")
+        if report_file and not Path(report_file).parent.is_dir():
+            raise ValueError("Report parent directory must already exist")
+        destinations = [get_output_path(d, output_path, preserve_structure, base_dir) for d in documents]
+        planned_files = destinations + auxiliary
+        file_locations = {_canonical_path_key(p) for p in planned_files + documents + supplied_files}
+        for planned in planned_files:
+            if planned.exists() and not planned.is_file():
+                raise ValueError(f"Output is not a regular file: {planned}")
+            for parent in planned.resolve().parents:
+                if os.path.normcase(str(parent)) in file_locations:
+                    raise ValueError(f"Output file is also required as a directory: {parent}")
+                if parent.exists() and not parent.is_dir():
+                    raise ValueError(f"Output parent is not a directory: {parent}")
+        for index, auxiliary_path in enumerate(auxiliary):
+            if auxiliary_path.exists() and not auxiliary_path.is_file():
+                raise ValueError(f"Auxiliary output is not a regular file: {auxiliary_path}")
+            for protected in documents + supplied_files + destinations + auxiliary[:index]:
+                if _paths_alias(auxiliary_path, protected):
+                    raise ValueError(f"Auxiliary output {auxiliary_path} aliases input/output {protected}")
+        # Index all protected ancestors once: large PDF batches must not incur
+        # a quadratic resolve/stat pass just to check asset folder overlap.
+        protected_ancestors = set()
+        for protected in documents + supplied_files + destinations + auxiliary:
+            resolved = Path(protected).resolve()
+            protected_ancestors.update(os.path.normcase(str(p)) for p in (resolved, *resolved.parents))
+        for document, destination in zip(documents, destinations):
+            if document.suffix.lower() == ".pdf":
+                assets = destination.parent / f"{destination.stem}_assets"
+                if _canonical_path_key(assets) in protected_ancestors:
+                    raise ValueError(f"PDF assets {assets} overlap an input/output")
+    except (OSError, RuntimeError, ValueError) as exc:
+        blocked_sources.update(str(d) for d in documents)
+        output_conflicts.append(f"Cannot validate output paths: {exc}")
+
+    if output_conflicts:
+        result.failed = max(1, len(blocked_sources))
+        result.errors.extend(
+            f"[output_collision] {message}" for message in output_conflicts
+        )
+        for message in output_conflicts:
+            logger.error(message)
+        result.total_time = time.time() - start_time
+        return result
+
     if not documents:
         logger.info("No documents found to convert.")
         return result
-    
-    logger.info(f"Found {len(documents)} documents to process")
-    
-    # Prepare output directory
-    output_path = Path(output_dir) if output_dir else None
-    if output_path:
+
+    # A dry-run only inspects inputs and plans work. It does not create an
+    # output directory, progress log, or checkpoint. --report remains an
+    # explicit caller-controlled output outside batch_convert().
+    if output_path and not dry_run:
         output_path.mkdir(parents=True, exist_ok=True)
-    
-    # v1.1: Set up file-based logging
-    if log_file or output_path:
+
+    if not dry_run and (log_file or output_path):
         log_path = Path(log_file) if log_file else (
             output_path / "conversion_progress.log"
         )
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            fh = logging.FileHandler(
-                str(log_path), encoding='utf-8'
-            )
+            fh = logging.FileHandler(str(log_path), encoding='utf-8')
             fh.setFormatter(logging.Formatter(
                 '%(asctime)s | %(levelname)-7s | %(message)s',
                 datefmt='%Y-%m-%d %H:%M:%S'
@@ -1126,12 +1312,7 @@ def batch_convert(
             logger.info(f"Logging to: {log_path}")
         except OSError:
             pass  # file logging is best-effort
-    
-    # Determine base directory for structure preservation
-    base_dir = None
-    if preserve_structure and len(input_dirs) == 1:
-        base_dir = Path(input_dirs[0])
-    
+
     # v1.1: Checkpoint for resume
     checkpoint_path = None
     completed_paths_set = set()
@@ -1709,8 +1890,12 @@ def save_report(result: BatchResult, output_path: str):
         ]
     }
     
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+    # Public API callers receive the same guard as the CLI for known sources.
+    target = Path(output_path)
+    for conversion in result.results:
+        if any(_paths_alias(target, Path(p)) for p in (conversion.input_path, conversion.output_path)):
+            raise ValueError("Report path aliases conversion input/output")
+    _write_text_atomic(target, json.dumps(report, indent=2, ensure_ascii=False))
     
     logger.info(f"Report saved to: {output_path}")
 
@@ -1718,7 +1903,7 @@ def save_report(result: BatchResult, output_path: str):
 def main():
     parser = argparse.ArgumentParser(
         description="""
-KingAI Markdown Converter v1.2 - Batch document conversion
+KingAI Markdown Converter v1.3 - Batch document conversion
 
 Converts PDF, DOCX, XLSX, PPTX, and more to Markdown.
 Uses multiprocessing with graceful degradation for large runs.
@@ -1897,10 +2082,11 @@ Examples:
             resume=args.resume,
             log_file=args.log_file,
             file_timeout=args.file_timeout,
+            report_file=args.report,
         )
         
         # Save report if requested
-        if args.report:
+        if args.report and not any(error.startswith("[output_collision]") for error in result.errors):
             save_report(result, args.report)
         
         # Return appropriate exit code

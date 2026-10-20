@@ -39,7 +39,7 @@ the installed version.
 
 ## Requirements
 
-- Python 3.10 or newer is recommended.
+- Python 3.10 or newer is required.
 - Install Python dependencies from `requirements.txt`.
 - LibreOffice is optional but strongly recommended for `.doc`, `.xls`, `.ppt`,
   `.odt`, `.ods`, `.odp`, and difficult `.rtf` files.
@@ -51,6 +51,15 @@ installed elsewhere.
 ```powershell
 python -m pip install -r requirements.txt
 ```
+
+The versioned GitHub release includes a wheel and source archive. Install the
+wheel with `python -m pip install ./kingai_markdown_converter-1.3.0-py3-none-any.whl`.
+This installs the core MarkItDown dependency. Add the optional backends from
+`requirements.txt` for the full set of formats. The installed command
+`kingai-markdown --help` works from any directory; paths stay relative to your
+current working directory. The Windows `convert.bat` launcher also works outside
+the source directory and preserves the converter's exit code. It never installs
+packages or pauses automatically.
 
 ## Basic Usage
 
@@ -90,6 +99,26 @@ they begin processing.
 
 ## Existing Output and Resume Rules
 
+- Before any output directory or progress log is created, the converter checks
+  all requested output paths for collisions and source aliases. Two input files
+  such as `same.pdf` and `same.docx` cannot both write `same.md`.
+- A source `.md` file is never its own output, even with `--overwrite`.
+  Symlink aliases are also refused. Give converted Markdown sources a separate,
+  non-colliding destination or exclude them.
+- An output collision is a fail-closed planning error (`output_collision`);
+  **no conversions are launched**, including unrelated files in the same batch.
+  Resolve duplicate stems or use separate output folders.
+- `--dry-run` neither creates output directories nor writes progress logs or
+  checkpoints. Explicit `--report` still writes the requested JSON report.
+- Report, log and checkpoint paths cannot alias selected inputs or Markdown
+  outputs. Existing hardlinks are checked in addition to symlinks and Windows
+  case aliases. A report refused during planning is never written.
+- Markdown and checkpoint/report files are published from complete temporary
+  files. Without `--overwrite`, atomic no-clobber publication refuses a file
+  that appeared while extraction was running. Filesystems without hardlink
+  support fail closed in this mode.
+- Missing input paths and invalid worker/batch/timeout limits return failure.
+  Overlapping input roots are deduplicated.
 - Without `--overwrite`, an existing destination `.md` file is skipped.
 - `--resume` loads `.convert_checkpoint.json` from the output folder.
 - A checkpoint entry is trusted only while its expected Markdown file exists.
@@ -113,15 +142,18 @@ For a text-free or image-only PDF, the converter writes:
 
 This preserves the document for visual inspection and multimodal tooling. It is
 not OCR and does not claim that text inside the images was recognized.
+An existing asset folder is always preserved. To regenerate page images, select
+a fresh output location. An interrupted image render may leave partial new
+assets; preserve or inspect those before retrying in a fresh output location.
 
 Spreadsheet output includes only populated rows and columns. This avoids huge,
 mostly empty Markdown tables caused by stale worksheet dimensions.
 
 ## Error Handling
 
-Reports classify failures as `invalid_file`, `corrupt_file`,
+Reports classify conversion failures as `invalid_file`, `corrupt_file`,
 `extractor_crash`, `timeout`, `memory_error`, `dependency_missing`, or
-`permission_error`. Zero-byte and obviously invalid files fail pre-flight
+`permission_error`; output planning adds `output_collision`. Zero-byte and obviously invalid files fail pre-flight
 without being sent through every parser.
 
 When one worker exceeds its timeout, that worker pool is stopped. Other files in
@@ -137,6 +169,22 @@ the timeout.
 - Password-protected, damaged, or zero-byte source files require a valid source
   copy before conversion.
 - Review safety-critical technical content against the original document.
+- Output planning assumes inputs and their parent directories are not changed
+  concurrently. It is not a filesystem sandbox or a transaction across an
+  entire batch. Prior successful files remain after a later file fails.
+- Resume currently checks output existence, not input content hashes; use a
+  fresh output location after changing source content or conversion options.
+- Optional parser support and external LibreOffice behavior vary by platform.
+  See [the script review and qualification ledger](docs/REVIEW.md) for the tested
+  release scope and outstanding backend/platform qualification.
+
+## Version 1.3
+
+- Integrates PR #1's source/output collision and dry-run protection.
+- Adds hardlink and auxiliary-output collision protection, atomic text writes,
+  portable installation, non-interactive launcher behavior and regression tests.
+- Keeps the original main and PR branch history; the preservation manifest is
+  [docs/SOURCES.json](docs/SOURCES.json).
 
 ## Version 1.2
 
