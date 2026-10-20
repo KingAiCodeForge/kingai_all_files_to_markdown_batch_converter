@@ -16,4 +16,3 @@ kingai-markdown = "convert:main"
 
 [tool.setuptools]
 py-modules = ["convert"]
-
